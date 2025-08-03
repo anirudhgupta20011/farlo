@@ -1,0 +1,32 @@
+name: Farlo Scraper
+
+on:
+  schedule:
+    - cron:  '*/15 * * * *'    # run every 15 minutes
+  workflow_dispatch:        # allow manual runs
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python & Playwright
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install playwright gspread oauth2client pytz bs4
+          playwright install --with-deps chromium
+
+      - name: Inject credentials
+        run: |
+          echo "${{ secrets.GSPREAD_CREDS }}" | base64 -d > credentials.json
+
+      - name: Run scraper
+        env:
+          TZ: Asia/Kolkata
+          GSPREAD_SHEET_KEY: ${{ secrets.GSPREAD_SHEET_KEY }}
+        run: |
+          source .venv/bin/activate
+          python farlo.py
