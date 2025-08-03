@@ -1,162 +1,146 @@
-import asyncio
-import time
-import re
-import os
+import asyncio, re, random, os
 from datetime import datetime
+
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
-# --- Google Sheets setup ---
-SCOPE = [
+# --- CONFIG -----------------------------------------------------------------------------
+CREDENTIALS_FILE = "credentials.json"
+GSHEET_ID = os.environ.get("GSPREAD_SHEET_KEY")
+if not GSHEET_ID:
+    raise ValueError("Missing required environment variable: GSPREAD_SHEET_KEY")
+INPUT_SHEET      = "Sheet2"
+OUTPUT_SHEET     = "Sheet1"
+
+RETRIES      = 3     # number of retries per SKU
+RETRY_DELAY  = 5     # seconds between retries
+
+# A small pool of real Chrome UAs to rotate through
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+]
+
+# --- GOOGLE SHEETS SETUP ----------------------------------------------------------------
+scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
-CLIENT = gspread.authorize(CREDS)
+creds  = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+gc     = gspread.authorize(creds)
+sheet  = gc.open_by_key(GSHEET_ID)
+in_ws  = sheet.worksheet(INPUT_SHEET)
+out_ws = sheet.worksheet(OUTPUT_SHEET)
 
-SPREADSHEET_KEY = os.environ.get("GSPREAD_SHEET_KEY")
-if not SPREADSHEET_KEY:
-    raise ValueError("Missing required environment variable: GSPREAD_SHEET_KEY")
-SPREADSHEET = CLIENT.open_by_key(SPREADSHEET_KEY)
-
-INPUT_SHEET = SPREADSHEET.worksheet("Sheet2")
-OUTPUT_SHEET = SPREADSHEET.worksheet("Sheet1")
-
-def timestamp():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def get_last_updated_time(row_idx):
-    """Get the last updated timestamp for a product from the output sheet"""
-    try:
-        cell_value = OUTPUT_SHEET.cell(row_idx, 1).value
-        if cell_value:
-            return datetime.strptime(cell_value, "%Y-%m-%d %H:%M:%S")
-    except:
-        pass
-    return None
-
-def should_update(row_idx, interval_minutes):
-    """Check if enough time has passed since last update"""
-    last_update = get_last_updated_time(row_idx)
-    if last_update is None:
-        return True
-    
-    time_diff = datetime.now() - last_update
-    return time_diff.total_seconds() >= (interval_minutes * 60)
-
-async def scrape_with_retries(page, product, url, idx, retries=3, delay=5):
-    for attempt in range(1, retries+1):
+# --- SCRAPE + WRITE WITH RETRIES ---------------------------------------------------------
+async def scrape_and_write(page, idx, product, url):
+    for attempt in range(1, RETRIES + 1):
         try:
-            # Navigate
+            # Navigate & wait
             await page.goto(url, timeout=60000)
             await page.wait_for_load_state("domcontentloaded")
+            # tiny randomized stealth delay
+            await page.wait_for_timeout(random.uniform(500, 1000))
 
-            # Bypass "Continue shopping" interstitial
-            if await page.locator("button:has-text('Continue shopping')").is_visible():
-                await page.click("button:has-text('Continue shopping')")
-                await page.wait_for_timeout(2000)
+            # --- Title ---
+            title_loc = page.locator("#productTitle").first
+            title = (await title_loc.inner_text()).strip() if await title_loc.count() else "N/A"
 
-            # Title
-            title = (await page.locator("#productTitle").inner_text(timeout=5000)).strip()
+            # --- Price ---
+            price_loc = page.locator("span.a-price > span.a-offscreen").first
+            price_txt = (await price_loc.inner_text()).strip() if await price_loc.count() else "500"
+            price_val = price_txt.replace("₹", "").replace(",", "").strip()
 
-            # Price
-            price = (
-                await page.locator("span.a-price > span.a-offscreen")
-                              .first
-                              .inner_text(timeout=5000)
-            ).strip()
-            price_clean = price.replace("₹", "").replace(",", "")
-
-            # Seller & Quantity
+            # --- Seller ---
             seller = "Unknown"
-            qty = "Unknown"
             if await page.locator("#sellerProfileTriggerId").count():
-                seller = (await page
-                            .locator("#sellerProfileTriggerId")
-                            .inner_text()).strip()
+                seller = (await page.locator("#sellerProfileTriggerId").first.inner_text()).strip()
             else:
-                mi = await page.locator("#merchant-info").inner_text()
-                seller = mi.split("Sold by")[-1].split(".")[0].strip()
+                mi = page.locator("#merchant-info").first
+                if await mi.count():
+                    txt = (await mi.inner_text()).strip()
+                    m = re.search(r"Sold by\s+([^\.]+)", txt)
+                    if m:
+                        seller = m.group(1).strip()
 
+            # --- Quantity in Buy Box ---
             opts = await page.locator("select#quantity option").all_inner_texts()
-            nums = [int(o) for o in opts if o.strip().isdigit()]
-            if nums:
-                qty = "30+" if max(nums) >= 30 else str(max(nums))
+            nums = [int(m.group(1)) for o in opts if (m := re.search(r"(\d+)", o))]
+            qty = "30+" if nums and max(nums) >= 30 else str(max(nums)) if nums else "Unknown"
+            seller_qty = f"{seller} – {qty}"
 
-            seller_qty = f"{seller} - {qty}"
-
-            # Brand
-            brand = "BRAND"
-            if await page.locator("th:has-text('Brand') + td").count():
-                brand = (await page
-                          .locator("th:has-text('Brand') + td")
-                          .inner_text()).strip().upper()
+            # --- Brand ---
+            brand = "Brand"
+            b_loc = page.locator("th:has-text('Brand') + td").first
+            if await b_loc.count():
+                brand = (await b_loc.inner_text()).strip().upper()
             else:
                 m = re.match(r"([A-Z]+)", product)
                 if m:
                     brand = m.group(1)
 
-            # # of Offers on the listing
-            offers = await page.locator(".olpOffer").count()
+            # --- Total # of Offers ---
+            offers = "1"
+            o_loc = page.locator("a[href*='/gp/offer-listing/']").first
+            if await o_loc.count():
+                txt = await o_loc.inner_text()
+                mo = re.search(r"(\d+)", txt.replace(",", ""))
+                if mo:
+                    offers = mo.group(1)
 
-            # Write to sheet
-            now = timestamp()
+            # --- Write back A–H ---
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             row = [
                 now,
                 product,
                 title,
-                f"₹{price_clean}",
+                f"₹{price_val}",
                 url,
                 seller_qty,
                 brand,
-                str(offers),
+                offers
             ]
-            OUTPUT_SHEET.update(f"A{idx}:H{idx}", [row])
-            print(f"{now} – {product}: ₹{price_clean} | {seller_qty} | {brand} | offers: {offers}")
+            out_ws.update(f"A{idx}:H{idx}", [row])
+            print(f"{now} – {product}: ₹{price_val} | {seller_qty} | {brand} | offers: {offers}")
             return True
 
-        except PlaywrightTimeoutError as e:
-            print(f"[Retry {attempt}/{retries}] Timeout for {product}: {e}")
         except Exception as e:
-            print(f"[Retry {attempt}/{retries}] Error for {product}: {e}")
+            print(f"[Retry {attempt}/{RETRIES}] {product}: {e}")
+            if attempt < RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                print(f"Failed after retries: {product}")
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                fallback = [
+                    now, product, "Error", "₹500", url,
+                    "Unknown – Unknown", "Brand", "0"
+                ]
+                out_ws.update(f"A{idx}:H{idx}", [fallback])
+                return False
 
-        if attempt < retries:
-            await asyncio.sleep(delay)
-
-    # Permanent failure fallback
-    now = timestamp()
-    fallback = [
-        now, product, "Error", "₹500", url, "Unknown - Unknown", "BRAND", "0"
-    ]
-    OUTPUT_SHEET.update(f"A{idx}:H{idx}", [fallback])
-    print(f"✖ permanent fail: {product}")
-    return False
-
+# --- MAIN LOOP -----------------------------------------------------------------------------
 async def main():
     async with async_playwright() as pw:
+        # launch once with rotating UA + stealth
         browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context()
+        ua = random.choice(USER_AGENTS)
+        context = await browser.new_context(user_agent=ua, locale="en-US")
+        await context.add_init_script("""
+            () => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); }
+        """)
         page = await context.new_page()
 
-        products  = INPUT_SHEET.col_values(1)[1:]
-        urls      = INPUT_SHEET.col_values(2)[1:]
-        intervals = INPUT_SHEET.col_values(3)[1:]
+        data    = in_ws.get_all_values()
 
-        scraped_count = 0
-        for idx, (prod, url, ival) in enumerate(zip(products, urls, intervals), start=2):
-            interval = int(ival.strip()) if ival.strip().isdigit() else 60
-            
-            if should_update(idx, interval):
-                print(f"Scraping {prod} (interval: {interval}min)")
-                ok = await scrape_with_retries(page, prod, url, idx)
-                if ok:
-                    scraped_count += 1
-            else:
-                print(f"Skipping {prod} (not due for update)")
+        for i, line in enumerate(data[1:], start=2):
+            if len(line) < 3 or not line[0].strip() or not line[1].strip():
+                continue
+
+            product, url, _ = line[:3]
+            await scrape_and_write(page, i, product, url)
 
         await browser.close()
-        print(f"Scraping complete. Updated {scraped_count} products.")
 
 if __name__ == "__main__":
     asyncio.run(main())
