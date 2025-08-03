@@ -2,7 +2,7 @@ name: Farlo Scraper
 
 on:
   schedule:
-    - cron:  '*/15 * * * *'    # run every 15 minutes
+    - cron:  '*/8 * * * *'     # run every 8 minutes (approximately 500 seconds)
   workflow_dispatch:        # allow manual runs
 
 jobs:
